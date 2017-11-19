@@ -1,11 +1,16 @@
 // based on part of  http://www.esp8266.com/viewtopic.php?f=8&t=4865#
 // 
 // ver YY-MM-DD    stuff
-   String my_ver = "16" ;
+   String my_ver = "16c" ;
 //  16 17-11-14  last version had some sucess at balancing - trying out logging arrays. cleaning commented code
 //               -might want to examine Brokkings code to make speeds linear - do a spreadsheet calculation
 //               -wonder if our balance point is close to vertical (until battery shifts)
 //               a) added debug logging to arrays, and display to console at 30 degree siesta
+//               b) include control parameters at top of dump to help analysis
+//               - need to change I-fade formula
+//               -need to check the final flounder: wheels still turning after bot is laid down
+//               c) red led tracks debug data storage, goes off when bot passes 30 degrees
+//               -check balance point by hanging bot upside down by the wheels.
 //  15 17-11-12  adapt to new A4988 motor drivers in setup and timer ISR
 //               a) remove obsolete i2c_flag method of avoiding motor shield I2B bus interruptions
 //               b) add spd macros, rework debug output
@@ -74,21 +79,38 @@
 //  1  17-09-27  stole code from web and played with timers
 
 // ---------- parameters ----- put frequently changed parameters near top of file so they can be found easily
-const int acc_calibration_value = +535;                            //15 Enter the accelerometer calibration value. was -1200
+const int acc_calibration_value = -1125;                            //15 Enter the accelerometer calibration value. was -1200
                                                                     // andrew's constant = +535, doug's constant = -1356, no, -1125
 const volatile int speed = -1;                                      // for initial testing of interrupt driven steppers
                                                                     //  speed = -1 enables IMU based balancing. 
                                                                     //  speed = n enables fixed forward speed interval of n, 0 is brakes on
-const int bot_slow = 1600;                                          //15 # of interrupts between steps at slowest workable bot speed
-const int bot_fast = 400;                                           //15 # of interrupts between steps at fastest workable bot speed
-const float PID_I_fade = .95;                                         //15 how much of pid_i_mem history to retain
+const int bot_slow = 2300;                                          //15 # of interrupts between steps at slowest workable bot speed
+const int bot_fast = 250;                                           //15 # of interrupts between steps at fastest workable bot speed
+const float PID_I_fade = .80;                                         //15 how much of pid_i_mem history to retain
 
 //Various PID settings
-float pid_p_gain = 50;                                              //Gain setting for the P-controller (15)
-float pid_i_gain = 5;                                             //Gain setting for the I-controller (1.5)
+float pid_p_gain = 30;                                              //Gain setting for the P-controller (15)
+float pid_i_gain = 1.2;                                             //Gain setting for the I-controller (1.5)
 float pid_d_gain = 30;                                              //Gain setting for the D-controller (30)
 float turning_speed = 30;                                           //Turning speed (20)
 float max_target_speed = 150;                                       //Max target speed (100)
+
+//  spreadsheet formula for speed
+//  =IF(D8=0,0,ROUND($F$1 * (1000000/(D8*20))*3.1415926*4/200+25,1))
+//  $F$1 is a scaling constant to make the graph comparable in size to other graphs
+//  D8 is the step interval, in units of 20 usec
+//  The 25 near the end is to offset the graphs so they don't overlap, particularly for 0
+
+//  speed = [ steps per second ] * [ distance per step ]
+//   = [10e6 usec / (step interval * step duration)] * [circumference / steps per rotation]
+//   = [1,000,000 / ( D8 * 20 usec) ] * [ (PI * Diameter ) / 200 ]
+//   = [ 50,000 / D8 ] * [ ( 3.15.1926 * 4 inches ) / 200 ]
+//   = ( 50,000 * 3.1415926 * 4 ) / ( D8 * 200 )
+//   = ( 1000 * 3.1415926 ) / D8
+//   = 3141.5926 / D8  inches per second
+
+// observed top speed = 300 for step interval > 10.47 inches per second
+// observed slowest speed = 2300 step interval > 1.37 inches per second
 
 
 const long usec_per_t0_int = 20;                                          // number of microseconds between t0 timer interrupts
@@ -130,7 +152,7 @@ unsigned int log_millis[log_size];                                  //16 timesta
 float log_angle[log_size];                                        // gyro angle, in degrees, -ve means leaning forward
 float log_pid[log_size];                                            // value of pid_output_left, the final pid that's used
 int log_motor[log_size];                                            // value of left_motor - actual step interval, as an interrupt count
-//float log_1[log_size];                                              // filler to see what the limits are
+float log_1[log_size];                                              //16 value of pid_i_mem for tracking PID_I_fade performance
 //float log_2[log_size];
 int lognum;                                                         // general index into debug logging arrays
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -144,8 +166,6 @@ volatile int right_motor, throttle_right_motor, throttle_counter_right_motor, th
 int battery_voltage;
 int receive_counter;
 int gyro_pitch_data_raw, gyro_yaw_data_raw, accelerometer_data_raw;
-//15 int left_dir = FORWARD, right_dir = FORWARD;    
-// we can't change controller direction - have to remember what direction to give in onestep function
 
 long gyro_yaw_calibration_value, gyro_pitch_calibration_value;
 
@@ -334,7 +354,8 @@ void setup() {
   
   sp("[setup] u-seconds between t0 interrupts = "); spl(usec_per_t0_int);   //9 
 
-//16 pre-fill debug arrays, to see if this triggers dynamic memory allocation and resulting problems
+/*
+ * //16 pre-fill debug arrays, to see if this triggers dynamic memory allocation and resulting problems
   for (lognum=1; lognum<=log_size; lognum++)
   {
     log_millis[lognum] = millis();
@@ -344,7 +365,8 @@ void setup() {
 //    log_1[lognum] = sqrt(lognum);
 //    log_2[lognum] = lognum * lognum;
   }
-    lognum = log_size+1;                                                        //15 index into debug arrays. This value means not yet logging
+  */
+    lognum = log_size+1;                                                  //15 index into debug arrays. This value means not yet logging
     dump_count = 1;                                                       //16 add to filename to separate multiple dumps from same compile
  
   Serial.println("--Setup complete");
@@ -396,7 +418,8 @@ void loop() {
   if(start == 0 && angle_acc > -0.5&& angle_acc < 0.5){             //If the accelerometer angle is almost 0
     angle_gyro = angle_acc;                                         //Load the accelerometer angle in the angle_gyro variable
     start = 1;                                                      //Set the start variable to start the PID controller
-    if(lognum == log_size + 1) lognum = 1;                          //16 and start debug logging into memory arrays
+    digitalWrite(BUILTIN_LED,LOW);                                  //16 turn on red LED to show we're storing debug data, no longer dormant.
+    if(lognum == log_size + 1) lognum = 0;                          //16 and start debug logging into memory arrays
   }
   
   Wire.beginTransmission(gyro_address);                             //Start communication with the gyro
@@ -442,7 +465,7 @@ void loop() {
 //  pid_i_mem += pid_i_gain * pid_error_temp;                         //Calculate the I-controller value and add it to the pid_i_mem variable
   temp = pid_i_gain * pid_error_temp;                               //15 current I controller value
   hold2 = pid_i_mem;                                                //15 grab it for debugging before it gets changed
-  pid_i_mem =temp * PID_I_fade + pid_i_mem * (1-PID_I_fade);        //15 allow impact of past pid_i_mem history to fade out over time
+  pid_i_mem =temp + PID_I_fade * pid_i_mem;                         //15 allow impact of past pid_i_mem history to fade out over time
   if(pid_i_mem > pid_max)pid_i_mem = pid_max;                       //Limit the I-controller to the parameterized maximum controller output
   else if(pid_i_mem < pid_min)pid_i_mem = pid_min;
   
@@ -461,6 +484,9 @@ void loop() {
     pid_i_mem = 0;                                                  //Reset the I-controller memory
     start = 0;                                                      //Set the start variable to 0
     self_balance_pid_setpoint = 0;                                  //Reset the self_balance_pid_setpoint variable
+    throttle_left_motor = 0;                                        //16 stop the wheels from moving
+    throttle_right_motor = 0;
+    digitalWrite(BUILTIN_LED,HIGH);                                 //16 turn off red LED to show we're dumping debug data, and going dormant.
     if(lognum < log_size + 1) log_dump();                           //16 if we logged data, dump it to console for processing, & reprime logging
   }
 //-----------------------Control Calculations (does nothing without numchuk controller to provide "received_byte", which stays at zero
@@ -549,7 +575,7 @@ hold = pid_output_left;
   else                                                              //11 restructure conditional so we don't have a brief wrong setting
      {
 /*
-     if(0 < left_motor  < 25) left_motor =  25;                    //11 avoid high speeds that have a high interrupt load
+     if(0 < left_motor  < 25) left_motor =  25;                     //11 avoid high speeds that have a high interrupt load
      if(0 > left_motor  >-25) left_motor  = -25;                    //11 avoid high speeds that have a high interrupt load
      if(0 < right_motor < 25) right_motor =  25;
      if(0 > right_motor >-25) right_motor = -25;
@@ -560,23 +586,23 @@ hold = pid_output_left;
      interrupts();                                                  //10 ..by briefly disabling interrupts
      }
 //16 do some data logging / telemetry for debugging purpose
-     if(lognum < log_size)                                              //16 lognum is set to log_size+1 in setup, meaning no logging. enable by setting to 1
+     if(lognum < log_size)                                          //16 lognum is NOT set to log_size+1 in setup, meaning no logging, capture snapshot
      {
        lognum++ ;                                                   //16 increment the index into debug logging arrays
        log_millis[lognum] = millis();                               //16 note timestamp
        log_angle[lognum] = angle_gyro;                              //16 gyro angle
        log_pid[lognum] = pid_output_left;                           //16 left motor pid
        log_motor[lognum] = left_motor;                              //16 interval for interrupt level steps
-//       log_1[lognum] = 0;                                         //16 we'll find a use for this later
+       log_1[lognum] = pid_i_mem;                                   //16 track pid_i_mem to see how PID_I_fade is working
 //       log_2[lognum] = 0;         
      }
 
 // do some debug output to serial monitor to see whats going on
 
 //count 4 millesecond loops to get to a second, and dump debug info once a second
-  if (i++ > 250)                                                    // if a full second has passed, dump debug info
+  if (i++ > 250)                                                      // if a full second has passed, display debug info
     {
-     i = 0;                                                         // prepare to count up to next second
+     i = 0;                                                           // prepare to count up to next second
 
      spd("--pid_error_temp= ",pid_error_temp); spd("  angle_gyro= ",angle_gyro); spd("  self_balance_pid_setpoint= ",self_balance_pid_setpoint); 
         spdl("  pid_setpoint= ",pid_setpoint);
@@ -584,20 +610,24 @@ hold = pid_output_left;
      spd("  pid_i_mem= ",hold2);spdl("  initial pid_output= ",hold3);
 //     spd("  throttle_left_motor= ",throttle_left_motor); spd("  left_motor= ",left_motor);         
 
-       loop_mics = micros() - mics;                             //11  calculate main loop time, in microseconds
-//       sp("main loop time(mics,millis)= ");sp(loop_mics);                    //11  and print the one that contains once a second prints 
+       loop_mics = micros() - mics;                                   //11  calculate main loop time, in microseconds
+//       sp("main loop time(mics,millis)= ");sp(loop_mics);           //11  and print the one that contains once a second prints 
 //       spc; sp(millis()-millis_now); spc; 
 //       if(debug_out2 != 0) spl(last_millis);                        //11 conditionalize display of previous (non-debug) loop length   
-//       spc; spl(throttle_left_motor);                             //11  and print the one that contains once a second prints 
+//       spc; spl(throttle_left_motor);                               //11  and print the one that contains once a second prints 
     }
-           last_millis = millis()-millis_now;                       //11 track previous loop's length as well, to see one without serial output
+           last_millis = millis()-millis_now;                         //11 track previous loop's length as well, to see one without serial output
 
 //------------------------------ Loop time timer
 
   //The angle calculations are tuned for a loop time of 4 milliseconds. To make sure every loop is exactly 4 milliseconds a wait loop
   //is created by setting the loop_timer variable to +4000 microseconds every loop.
-  while(loop_timer > micros());                                       // spin in this while until micros() catches up with loop_timer
-  loop_timer += 4000;
+  if(loop_timer > micros())                                           //16 if the target loop end time is still in the future..
+  {
+    while(loop_timer > micros()) {};                                  // spin in this while until micros() catches up with loop_timer
+  }                                                                   //16 no spin time needed if we're already past old target loop end time
+    loop_timer = micros() + 4000;                                       //16 next target loop end time is 4 msec from now.
+
 }
 
 //16 ------------------- dump log arrays to console for capture/processing -----------------
@@ -611,16 +641,25 @@ void log_dump() {
   fname = comp_date.substring(0,3)+"-"+comp_date.substring(4,6)+"-"+comp_time.substring(0,2)+comp_time.substring(3,5)+ "-" + String(dump_count);
 
   spl(); spl();                                                       // make sure you start on a clean line
-  sp("====================================== START ============ ");   // make it easy to recognize start of data
-  spl(fname);                                                         // append suitable filename with compile date and time for ID purposes
+  spl("====================================== START ============ ");  //16 make it easy to recognize start of data
+  sp(fname); spl(".xlsx");                                                        //15 show suitable filename to be captured with data & used to store it
+  // now put the control parameters right into the dump, so we know how numbers were made
+  spdl("bot_slow, ",bot_slow);
+  spdl("bot_fast, ",bot_fast);
+  spdl("PID_I_fade, ",PID_I_fade);
+  spdl("p_gain, ",pid_p_gain);
+  spdl("i_gain, ",pid_i_gain);
+  spdl("d_gain, ",pid_d_gain);
+
+// output the dump arrays in Excel friendly format  
   for(log_n=1; log_n<lognum; log_n++)
   {
-  sp(log_millis[log_n]); spc; sp(log_angle[log_n]); spc; sp(log_pid[log_n]); spc; spl(log_motor[log_n]); 
-  yield();                                                            // had a watchdog timeout - hope this fixes it
+  sp(log_millis[log_n]); spc; sp(log_angle[log_n]); spc; sp(log_pid[log_n]); spc; sp(log_motor[log_n]); spc; spl(log_1[log_n]);
+  yield();                                                            // avoid a watchdog timeout
   }
   sp("====================================== END ============ ");     // make it easy to recognize start of data
   spl(fname);                                                         // append suitable filename with compile date and time for ID purposes
-  dump_count++ ;                                                      // on to next dump number, for filename purposes                    
+  dump_count++ ;                                                      // on to next dump number, for filename identifier purposes                    
   lognum = log_size + 1;                                              // prep for logging to start again when bot gets vertical
 }  // void log_dump
 
